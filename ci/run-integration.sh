@@ -13,12 +13,10 @@
 # Optional:
 #   TRANSPORT         stdio | launch | http                        (default: stdio)
 #   HAYBARN_UNITTEST  path to haybarn-unittest   (default: the one on PATH)
-#   PYTHON            command for the mock API, may contain spaces (default: python3)
+#   PYTHON            command for the replay server, may contain spaces (default: python3)
 #   MIN_EXECUTED      fail if fewer test cases ran (default: 1)
 #   EXPECTED_SKIP_REASONS  newline-separated skip reasons that are allowed,
 #                     e.g. "require-env METABASE_LIVE". Any other skip fails.
-#   RECIPES_WORKER    command that runs a recipe by name (`$RECIPES_WORKER <recipe>`);
-#                     when set, examples/test/*.test run too (stdio/launch only)
 #   KEEP_STAGE=1      keep the staged test tree for debugging
 #
 # Transports:
@@ -71,13 +69,13 @@ start_server() {
   echo "::error::'$*' never printed PORT:<n>"; cat "$log"; return 1
 }
 
-# The mock APIs fetch_items is tested against. The plain one rate-limits every
-# page once (429 + Retry-After) so the retry path is always exercised.
-unset METABASE_API_TOKEN
-MOCK_API_FLAKY=1 start_server "$STAGE/mock.log" $PYTHON "$REPO/test/mock_api/server.py"
-export METABASE_MOCK_API="http://127.0.0.1:$PORT"
-MOCK_API_TOKEN=test-token start_server "$STAGE/mock-auth.log" $PYTHON "$REPO/test/mock_api/server.py"
-export METABASE_MOCK_API_AUTH="http://127.0.0.1:$PORT"
+# The record/replay server (test/mock_api/server.py) every SQL test points its
+# `metabase` secret at: one replaying the recorded OSS instance, one adding the
+# synthetic Pro/Enterprise Usage Analytics models.
+start_server "$STAGE/mock.log" $PYTHON "$REPO/test/mock_api/server.py"
+export METABASE_FIXTURE_URL="http://127.0.0.1:$PORT"
+start_server "$STAGE/mock-ee.log" $PYTHON "$REPO/test/mock_api/server.py" --edition ee
+export METABASE_EE_FIXTURE_URL="http://127.0.0.1:$PORT"
 
 HTTP=0
 case "$TRANSPORT" in
@@ -95,9 +93,6 @@ esac
 # standalone runner links no extensions) and loading httpfs for HTTP workers.
 mkdir -p "$STAGE/test/sql"
 TEST_FILES=("$REPO"/test/sql/*.test)
-if [ -n "${RECIPES_WORKER:-}" ] && [ "$HTTP" = "0" ]; then
-  TEST_FILES+=("$REPO"/examples/test/*.test)
-fi
 for f in "${TEST_FILES[@]}"; do
   awk -v http="$HTTP" '
     /^require[ \t]+vgi[ \t]*$/ {

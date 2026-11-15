@@ -25,16 +25,21 @@ src/
   worker.ts        # entry point: serves the catalog over stdio, --unix or --http
   catalog.ts       # assembles the catalog; add new functions to FUNCTIONS
   meta.ts          # catalog/schema metadata + helpers (objectTags, column)
-  greet.ts         # scalar example (overloads, const param with choices)
-  sequence.ts      # table function example (named args, streaming state)
-  fetch_items.ts   # REST API table function (pagination, retries, secrets)
+  metabase/client.ts    # metabase secret -> x-api-key or /api/session, 429/5xx retries
+  metabase/pushdown.ts  # SQL filters -> API parameters and time windows
+  metabase/table.ts     # the generic list-endpoint table (phases, paging, fan-out state)
+  metabase/lookups.ts   # collection paths, owner names, edition, recipient/connection masking
+  metabase/mbql.ts      # legacy MBQL + pMBQL: query type, native SQL, sources, template tags
+  metabase/resources.ts # content, lineage, data model, admin, delivery, revisions tables
+  metabase/usage.ts     # instance, content_usage, query_history (Usage Analytics), recent_views
+  metabase/run.ts       # run_card with result-metadata-typed columns
   cli.ts           # flag parsing: stdio / --unix / --http (PORT:<n>, /health)
   log.ts           # stderr logger
-bin/               # vgi-metabase-worker (what DuckDB launches) and run-recipe
+bin/               # vgi-metabase-worker (what DuckDB launches)
 tests/             # bun unit tests (worker subprocess + mock API)
 test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
-examples/          # recipes: pushdown, caching, catalog tables, aggregates, COPY …
+test/mock_api/     # record / replay server (strict replay, auth emulation, synthetic EE usage)
+test/fixtures/     # recording of a real Metabase OSS container + seed / record scripts
 ci/                # integration harness used by `make test-sql` and CI
 scripts/           # vgi_template.py (init / template-diff)
 vgi-agent-tests.yaml  # private graders for the agent test tasks

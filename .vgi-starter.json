@@ -15,6 +15,6 @@
     ".github/dependabot.yml"
   ],
   "name": "metabase",
-  "repo": "your-org/vgi-metabase",
+  "repo": "Query-farm/vgi-metabase",
   "initialized": "2026-11-15"
 }

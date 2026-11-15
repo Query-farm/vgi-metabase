@@ -6,8 +6,8 @@
 # The worker to attach, relative to this directory. Build it first with `make build`.
 location = "bin/vgi-metabase-worker"
 
-# Fail on warnings while you build. Raise this to "info" before you publish the worker.
-fail_on = "warning"
+# Gate at info: zero findings of any severity.
+fail_on = "info"
 
 # Waive a finding only with a kind and a reason, so the waiver can be audited:
 #   domain-exemption  permanent and legitimate for this worker
@@ -15,7 +15,32 @@ fail_on = "warning"
 #   timing            slow or flaky because of the environment, not the metadata
 #   tooling-bug       the linter is wrong; report it upstream
 ignore = [
-  # { code = "VGI146", kind = "domain-exemption", reason = "every entry point needs a key" },
+  # Metabase ids (owner_id, card_id, table_id, folder_id, dashboard_id, database_id …) can point
+  # at archived, deleted, permission-hidden or other users' personal objects the secret's identity
+  # cannot list, so an ENFORCED + ALL_ROWS FOREIGN KEY would be false. Joins are documented in
+  # each table's docs instead (same decision as vgi-looker).
+  { code = "VGI808", kind = "domain-exemption", reason = "Metabase references can point at archived, deleted or permission-hidden objects; an enforced FOREIGN KEY would be false" },
+  { code = "VGI809", kind = "domain-exemption", reason = "shared id columns (owner_id, card_id, database_id, entity_id) reference objects that may be hidden from the API identity; no FOREIGN KEY can be attested" },
+]
+
+# content_usage / query_history are the shared BI vocabulary names (Looker, Tableau) and mass
+# nouns; instance is the single row describing the site.
+[per_object."metabase.main.content_usage"]
+ignore = [
+  { code = "VGI144", kind = "domain-exemption", reason = "shared BI vocabulary name (vgi-looker / vgi-tableau), a mass noun" },
+  { code = "VGI807", kind = "domain-exemption", reason = "OSS rows have NULL view_date, so (content_type, content_id, view_date) cannot be a NOT NULL key" },
+]
+[per_object."metabase.main.query_history"]
+ignore = [
+  { code = "VGI144", kind = "domain-exemption", reason = "shared BI vocabulary name (vgi-looker / vgi-tableau), a mass noun" },
+]
+[per_object."metabase.main.instance"]
+ignore = [
+  { code = "VGI144", kind = "domain-exemption", reason = "a single row describing the one Metabase site the secret points at" },
+]
+[per_object."metabase.main.card_tables"]
+ignore = [
+  { code = "VGI807", kind = "domain-exemption", reason = "one row per query source; a card can read the same table twice in one stage (self-joins), so no column set is unique" },
 ]
 
 # Adopting the gate on a worker that already has findings? Record them once with

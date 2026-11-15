@@ -1,148 +1,576 @@
 # name: test/sql/metabase.test
-# description: SQL-level tests for the metabase worker, run through DuckDB by ci/run-integration.sh
+# description: SQL tests for the metabase worker against the record/replay server (test/mock_api/server.py) and its recording of a real Metabase OSS 0.65 container
 # group: [metabase]
-# managed-by: vgi-starters (edit upstream in shared/, then run tools/render.py)
 
 require vgi
 
 require-env METABASE_WORKER
 
-require-env METABASE_MOCK_API
+require-env METABASE_FIXTURE_URL
 
-require-env METABASE_MOCK_API_AUTH
+require-env METABASE_EE_FIXTURE_URL
+
+# httpfs + json read the replay server's /__requests log to assert what was pushed down.
+statement ok
+LOAD httpfs;
+
+statement ok
+LOAD json;
 
 statement ok
 ATTACH 'metabase' (TYPE vgi, LOCATION '{METABASE_WORKER}');
 
-# ---------------------------------------------------------------- greet (scalar)
+# ---------------------------------------------------------------- secret errors
 
-query T
-SELECT metabase.main.greet('Ada');
-----
-Hi, Ada!
-
-query T
-SELECT metabase.main.greet('Ada', 'formal');
-----
-Good day, Ada.
-
-# NULL in, NULL out.
-query T
-SELECT metabase.main.greet(NULL);
-----
-NULL
-
-# Works over a whole column, one result per row.
-query T
-SELECT metabase.main.greet(name) FROM (VALUES ('Ada'), ('Grace'), (NULL)) AS t(name) ORDER BY ALL NULLS LAST;
-----
-Hi, Ada!
-Hi, Grace!
-NULL
-
-# `style` is constrained to 'casual' | 'formal' and checked when the query is bound.
-# (No expected message: each SDK words constraint errors its own way.)
 statement error
-SELECT metabase.main.greet('Ada', 'loud');
+SELECT count(*) FROM metabase.main.dashboards;
 ----
-<REGEX>:.*
+<REGEX>:.*no metabase secret.*
 
-# ------------------------------------------------------ sequence_table (table fn)
+statement ok
+CREATE SECRET mb_nocreds (TYPE metabase, BASE_URL '{METABASE_FIXTURE_URL}');
 
-query II
-SELECT n, squared FROM metabase.main.sequence_table(4) ORDER BY n;
+statement error
+SELECT count(*) FROM metabase.main.dashboards;
 ----
-0	0
-1	1
-2	4
-3	9
+<REGEX>:.*set api_key, or username and password.*
 
-# Named argument with a default.
+statement ok
+DROP SECRET mb_nocreds;
+
+statement ok
+CREATE SECRET mb_badkey (TYPE metabase, BASE_URL '{METABASE_FIXTURE_URL}', API_KEY 'mb_wrong');
+
+statement error
+SELECT count(*) FROM metabase.main.groups;
+----
+<REGEX>:.*HTTP 401 \(check api_key\).*
+
+statement ok
+DROP SECRET mb_badkey;
+
+statement ok
+CREATE SECRET mb_badpw (TYPE metabase, BASE_URL '{METABASE_FIXTURE_URL}', USERNAME 'ada@example.com', PASSWORD 'wrong');
+
+statement error
+SELECT count(*) FROM metabase.main.groups;
+----
+<REGEX>:.*login failed with HTTP 401 \(check username / password\).*
+
+statement ok
+DROP SECRET mb_badpw;
+
+statement ok
+CREATE SECRET mb_insecure (TYPE metabase, BASE_URL 'http://bi.example.com', API_KEY 'k');
+
+statement error
+SELECT count(*) FROM metabase.main.groups;
+----
+<REGEX>:.*https.*
+
+statement ok
+DROP SECRET mb_insecure;
+
+# A trailing /api is accepted and dropped; PAGE_SIZE 2 makes the users listing page.
+statement ok
+CREATE SECRET mb (TYPE metabase, BASE_URL '{METABASE_FIXTURE_URL}/api/', API_KEY 'mb_test_api_key', PAGE_SIZE '2');
+
+# --------------------------------------------------------------------- instance
+
+query TTTTTT
+SELECT tool, version, edition, is_hosted, usage_analytics, site_name FROM metabase.main.instance;
+----
+metabase	v0.65.4.4	oss	false	false	Acme Analytics
+
+# ------------------------------------------------------------------ folders
+
+query TTTTT
+SELECT id, title, folder_path, parent_id, owner FROM metabase.main.folders WHERE id IN ('2', '3', '4', '8', '9', '10') ORDER BY id::INT;
+----
+2	Examples	/Examples	NULL	NULL
+3	E-commerce	/Examples/E-commerce	2	NULL
+4	Ada Lovelace's Personal Collection	/Ada Lovelace's Personal Collection	NULL	Ada Lovelace
+8	Marketing	/Marketing	NULL	NULL
+9	EMEA	/Marketing/EMEA	8	NULL
+10	Finance	/Finance	NULL	NULL
+
+query TT
+SELECT collection_type, count(*) FROM metabase.main.folders GROUP BY ALL ORDER BY ALL;
+----
+trash	1
+NULL	10
+
+# archived = true reads only the archived listing.
 query I
-SELECT n FROM metabase.main.sequence_table(3, step := 5) ORDER BY n;
+SELECT count(*) FROM metabase.main.folders WHERE archived;
 ----
-0
-5
-10
+1
 
-# Larger than one batch: the cursor must carry across process calls.
-query II
-SELECT count(*), max(n) FROM metabase.main.sequence_table(25000);
+query T
+SELECT query FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/collection') ORDER BY seq DESC LIMIT 1;
 ----
-25000	24999
+{"archived": "true"}
 
-query I
-SELECT count(*) FROM metabase.main.sequence_table(0);
+# ---------------------------------------------------------------- dashboards
+
+query TTTTTITT
+SELECT tool, id, title, folder_path, owner, view_count, archived, replace(url, '{METABASE_FIXTURE_URL}', '') FROM metabase.main.dashboards ORDER BY id::INT;
 ----
-0
+metabase	1	E-commerce Insights	/Examples	Metabase Internal	2	false	/dashboard/1
+metabase	2	Sales Overview	/Marketing	Ada Lovelace	7	false	/dashboard/2
+metabase	3	Finance Archive	/Finance	Ada Lovelace	0	true	/dashboard/3
 
-# count is constrained to [0, 1000000].
-statement error
-SELECT * FROM metabase.main.sequence_table(-1);
+query TTTT
+SELECT created_at AT TIME ZONE 'UTC', updated_at AT TIME ZONE 'UTC', last_viewed_at AT TIME ZONE 'UTC', description FROM metabase.main.dashboards WHERE id = '2';
 ----
-<REGEX>:.*
+2026-11-15 10:04:26.696	2026-11-15 10:04:27.322	2026-11-15 10:04:26.696	Revenue, orders and people at a glance
 
-# Named arguments are constrained too: step >= 1.
-statement error
-SELECT * FROM metabase.main.sequence_table(3, step := 0);
+# id is filtered locally: GET /api/dashboard/:id would count as a view.
+query T
+SELECT query FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/dashboard') ORDER BY seq DESC LIMIT 1;
 ----
-<REGEX>:.*
+{"f": "archived"}
 
-# ------------------------------------------------- fetch_items (REST table fn)
-
-query IIT
-SELECT count(*), sum(id), min(name) FROM metabase.main.fetch_items('{METABASE_MOCK_API}', page_size := 4);
+query TTTTT
+SELECT p.id, p.name, p.slug, p.type, p.default_value FROM metabase.main.dashboards d, unnest(d.parameters) AS t(p) WHERE d.id = '2';
 ----
-25	325	item-01
+f1a2b3c4	Category	category	string/=	["Widget"]
+
+query T
+SELECT title FROM metabase.main.dashboards WHERE NOT archived ORDER BY title;
+----
+E-commerce Insights
+Sales Overview
+
+query T
+SELECT query FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/dashboard') ORDER BY seq DESC LIMIT 1;
+----
+{"f": "all"}
+
+# ----------------------------------------------------------- dashboard cards / tabs
+
+query TTTTTTTIIII
+SELECT id, tab_name, card_id, card_title, card_type, display, is_virtual, row, col, size_x, size_y FROM metabase.main.dashboard_cards WHERE dashboard_id = '2' ORDER BY id::INT;
+----
+37	Overview	40	Revenue by Category	question	bar	false	0	0	12	6
+38	Overview	41	Orders by Category (SQL)	question	table	false	0	12	12	6
+39	Details	NULL	NULL	NULL	text	true	0	0	24	2
+40	Details	44	People by Source	question	pie	false	2	0	12	6
+
+query T
+SELECT replace(text, chr(10), ' | ') FROM metabase.main.dashboard_cards WHERE dashboard_id = '2' AND is_virtual;
+----
+## Details | Order-level numbers.
+
+query TTT
+SELECT d.card_title, m.parameter_id, m.target FROM metabase.main.dashboard_cards d, unnest(d.parameter_mappings) AS t(m) WHERE d.dashboard_id = '2' ORDER BY d.card_title;
+----
+Orders by Category (SQL)	f1a2b3c4	["variable",["template-tag","category"]]
+Revenue by Category	f1a2b3c4	["dimension",["field",18,{"join-alias":"Products"}]]
+
+query TTII
+SELECT dashboard_title, title, position, card_count FROM metabase.main.dashboard_tabs ORDER BY dashboard_id::INT, position;
+----
+E-commerce Insights	Overview	0	12
+E-commerce Insights	Portfolio Performance	1	13
+E-commerce Insights	Website Analysis	2	11
+Sales Overview	Overview	0	2
+Sales Overview	Details	1	2
+
+# ------------------------------------------------------------------- charts
+
+query TTTTTTTITT
+SELECT id, title, card_type, display, query_type, folder_path, owner, view_count, archived, replace(url, '{METABASE_FIXTURE_URL}', '') FROM metabase.main.charts WHERE id::INT >= 40 ORDER BY id::INT;
+----
+40	Revenue by Category	question	bar	query	/Marketing	Ada Lovelace	3	false	/question/40
+41	Orders by Category (SQL)	question	table	native	/Marketing/EMEA	Ada Lovelace	2	false	/question/41
+42	Orders Model	model	table	query	/Marketing	Ada Lovelace	0	false	/model/42
+43	Order Count	metric	scalar	query	/Finance	Ada Lovelace	0	true	/metric/43
+44	People by Source	question	pie	query	/	Ada Lovelace	0	false	/question/44
+45	Large Orders from Model	question	table	query	/Marketing/EMEA	Ada Lovelace	0	false	/question/45
 
 query TI
-SELECT category, count(*) FROM metabase.main.fetch_items('{METABASE_MOCK_API}') GROUP BY category ORDER BY category;
+SELECT card_type, count(*) FROM metabase.main.charts GROUP BY ALL ORDER BY ALL;
 ----
-hardware	8
-service	8
-software	9
+metric	3
+model	2
+question	40
 
-# The harness runs METABASE_MOCK_API with MOCK_API_FLAKY=1: every page answers
-# 429 + Retry-After once, so every query above also exercised the retry path.
-
-# METABASE_MOCK_API_AUTH requires a bearer token ('test-token'). Every language's
-# fetch_items must put the HTTP status code in its error message.
-statement error
-SELECT count(*) FROM metabase.main.fetch_items('{METABASE_MOCK_API_AUTH}');
+# id = … reads one card.
+query TTTT
+SELECT title, database_id, table_id, source_card_id FROM metabase.main.charts WHERE id = '45';
 ----
-401
+Large Orders from Model	1	2	42
 
-statement ok
-CREATE SECRET metabase_api_test (TYPE metabase_api, TOKEN 'test-token');
+query T
+SELECT path FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/card/45') ORDER BY seq DESC LIMIT 1;
+----
+/api/card/45
+
+# table_id = … lists f=table plus the archived listing.
+query TT
+SELECT id, title FROM metabase.main.charts WHERE table_id = '1' ORDER BY id::INT;
+----
+32	People with age
+44	People by Source
+
+query T
+SELECT list(query ORDER BY seq) FROM (SELECT * FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/card') ORDER BY seq DESC LIMIT 2);
+----
+['{"f": "table", "model_id": "1"}', '{"f": "archived"}']
+
+query TT
+SELECT id, title FROM metabase.main.charts WHERE database_id = '1' AND NOT archived AND folder_path = '/Marketing/EMEA' ORDER BY id::INT;
+----
+41	Orders by Category (SQL)
+45	Large Orders from Model
+
+query T
+SELECT query FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/card') ORDER BY seq DESC LIMIT 1;
+----
+{"f": "database", "model_id": "1"}
+
+# ------------------------------------------------------------------- queries
+
+query TTT
+SELECT id, query_type, replace(native_sql, chr(10), ' | ') FROM metabase.main.queries WHERE id = '41';
+----
+41	native	SELECT p.CATEGORY, count(*) AS ORDERS, sum(o.TOTAL) AS REVENUE, max(o.CREATED_AT) AS LAST_ORDER | FROM ORDERS o JOIN PRODUCTS p ON p.ID = o.PRODUCT_ID | WHERE p.CATEGORY = {{category}} | GROUP BY p.CATEGORY
+
+query TTTTT
+SELECT t.name, t.type, t.display_name, t.default_value, t.required FROM metabase.main.queries q, unnest(q.template_tags) AS x(t) WHERE q.id = '41';
+----
+category	text	Category	Widget	NULL
+
+query TTTTT
+SELECT id, source_table_ids, source_card_ids, mbql_format, native_sql IS NULL FROM metabase.main.queries WHERE id IN ('40', '42', '45') ORDER BY id;
+----
+40	[2, 3]	[]	pmbql	true
+42	[2]	[]	pmbql	true
+45	[]	[42]	pmbql	true
+
+query T
+SELECT dataset_query->>'$.stages[0].source-card' FROM metabase.main.queries WHERE card_id = '45';
+----
+42
+
+# ------------------------------------------------------------------- lineage
+
+query TTTTTTT
+SELECT card_id, role, join_alias, table_id, source_card_id, table_name, database_name FROM metabase.main.card_tables WHERE card_id IN ('40', '45') ORDER BY card_id, role DESC;
+----
+40	source	NULL	2	NULL	ORDERS	Sample Database
+40	join	Products	3	NULL	PRODUCTS	Sample Database
+45	source	NULL	NULL	42	NULL	Sample Database
+
+# Native SQL questions have no lineage rows.
+query I
+SELECT count(*) FROM metabase.main.card_tables WHERE card_id = '41';
+----
+0
+
+query TI
+SELECT table_name, count(DISTINCT card_id) FROM metabase.main.card_tables WHERE table_id IS NOT NULL AND NOT archived GROUP BY ALL ORDER BY ALL;
+----
+ACCOUNTS	3
+ANALYTIC_EVENTS	4
+FEEDBACK	1
+ORDERS	23
+PEOPLE	3
+PRODUCTS	6
+
+# --------------------------------------------------------------- connections
+
+# Only host, port and the database name leave the connection details: the replay
+# server's synthetic connection 99 carries a fake password, SSH key and JDBC options.
+query TTTTTT
+SELECT id, title, engine, host, port, db_name FROM metabase.main.connections ORDER BY id::INT;
+----
+1	Sample Database	sqlite	NULL	NULL	/plugins/sample-database.sqlite
+99	Warehouse	postgres	db.internal.example.com	5432	analytics
 
 query I
-SELECT count(*) FROM metabase.main.fetch_items('{METABASE_MOCK_API_AUTH}', page_size := 25);
+SELECT count(*) FROM metabase.main.connections c WHERE to_json(c)::VARCHAR ILIKE '%secret%' OR to_json(c)::VARCHAR ILIKE '%hunter2%' OR to_json(c)::VARCHAR ILIKE '%metabase_ro%';
 ----
-25
+0
 
-# Several pages: the token must survive between batches (over HTTP each batch is a
-# separate request, so a token kept only in memory is lost after page 1).
-query I
-SELECT count(*) FROM metabase.main.fetch_items('{METABASE_MOCK_API_AUTH}', page_size := 7);
+query TT
+SELECT title, replace(url, '{METABASE_FIXTURE_URL}', '') FROM metabase.main.connections WHERE id = '99';
 ----
-25
+Warehouse	/admin/databases/99
+
+# ----------------------------------------------------------------- data model
+
+query TTTTT
+SELECT id, table_schema, table_name, display_name, entity_type FROM metabase.main.tables WHERE table_name IN ('ORDERS', 'PEOPLE', 'PRODUCTS') ORDER BY table_name;
+----
+2	(empty)	ORDERS	Orders	entity/TransactionTable
+1	(empty)	PEOPLE	People	entity/UserTable
+3	(empty)	PRODUCTS	Products	entity/ProductTable
+
+query TTTTT
+SELECT name, base_type, semantic_type, fk_target_table_id, fk_target_field_name FROM metabase.main.fields WHERE table_id = '2' ORDER BY position;
+----
+ID	type/BigInteger	type/PK	NULL	NULL
+USER_ID	type/Integer	type/FK	1	ID
+PRODUCT_ID	type/Integer	type/FK	3	ID
+SUBTOTAL	type/Float	NULL	NULL	NULL
+TAX	type/Float	NULL	NULL	NULL
+TOTAL	type/Float	NULL	NULL	NULL
+DISCOUNT	type/Float	type/Discount	NULL	NULL
+CREATED_AT	type/DateTime	type/CreationTimestamp	NULL	NULL
+QUANTITY	type/Integer	type/Quantity	NULL	NULL
+
+query T
+SELECT path FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/table/2/query_metadata') ORDER BY seq DESC LIMIT 1;
+----
+/api/table/2/query_metadata
+
+query II
+SELECT count(*), count(DISTINCT table_id) FROM metabase.main.fields WHERE database_id = '1';
+----
+71	8
+
+# The first /api/segment answers 503: the retry path runs.
+query TTTTT
+SELECT id, title, table_id, database_id, definition_description FROM metabase.main.segments;
+----
+1	Big Orders	2	1	Filtered by Total is greater than 100
+
+# ------------------------------------------------------------------- admin
+
+# PAGE_SIZE 2: users page at offset 0, 2, 4.
+query TTTTT
+SELECT id, display_name, email, is_active, is_superuser FROM metabase.main.users ORDER BY id::INT;
+----
+1	Ada Lovelace	ada@example.com	true	true
+2	Grace Hopper	grace@example.com	true	false
+3	Alan Turing	alan@partner.org	true	false
+4	Old Account	old@example.com	false	false
+
+query T
+SELECT list(query::JSON->>'offset' ORDER BY seq) FROM (SELECT * FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/user') ORDER BY seq DESC LIMIT 3);
+----
+[0, 2, 4]
+
+query TT
+SELECT email, group_ids FROM metabase.main.users WHERE NOT is_active;
+----
+old@example.com	[1]
+
+query T
+SELECT query::JSON->>'status' FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/user') ORDER BY seq DESC LIMIT 1;
+----
+deactivated
+
+# The first /api/permissions/group answers 429 with Retry-After: the retry path runs.
+query TTIT
+SELECT id, title, member_count, magic_group_type FROM metabase.main.groups ORDER BY id::INT;
+----
+1	All Users	4	all-internal-users
+2	Administrators	2	admin
+5	Analysts	2	NULL
+
+query TTTTT
+SELECT group_id, group_name, view_data, create_queries, download FROM metabase.main.group_permissions WHERE database_id = '1' ORDER BY group_id::INT;
+----
+1	All Users	unrestricted	query-builder-and-native	full
+2	Administrators	unrestricted	query-builder-and-native	full
+4	NULL	NULL	NULL	NULL
+5	Analysts	unrestricted	query-builder-and-native	full
+
+# ----------------------------------------------------------------- delivery
+
+query TTTTTIIIT
+SELECT id, title, dashboard_id, card_ids, channel_types, recipient_count, user_recipient_count, external_recipient_count, recipient_domains FROM metabase.main.subscriptions;
+----
+1	Sales Overview	2	[40]	[email]	2	1	1	[example.com, partner.org]
+
+query TTTTT
+SELECT s.channel_type, s.schedule_type, s.schedule_day, s.schedule_hour, s.enabled FROM metabase.main.subscriptions, unnest(schedules) AS t(s);
+----
+email	weekly	mon	8	true
+
+query TTTTTTIIIIT
+SELECT id, card_id, card_title, send_condition, active, cron_schedules, recipient_count, user_recipient_count, group_recipient_count, external_recipient_count, recipient_domains FROM metabase.main.alerts;
+----
+9	40	Revenue by Category	has_result	true	[0 0 9 * * ? *]	2	1	0	1	[example.com, partner.org]
+
+# Recipient addresses never reach SQL.
+query I
+SELECT count(*) FROM (SELECT to_json(s)::VARCHAR AS j FROM metabase.main.subscriptions s UNION ALL SELECT to_json(a)::VARCHAR FROM metabase.main.alerts a) WHERE j LIKE '%cfo@%' OR j LIKE '%ops@%' OR j LIKE '%grace@%';
+----
+0
+
+# ----------------------------------------------------------------- history
+
+query TTTTTT
+SELECT entity_type, entity_id, user_name, description, is_creation, diff->>'$.after.description' FROM metabase.main.revisions WHERE entity_type = 'card' AND entity_id = '41' ORDER BY changed_at;
+----
+card	41	Ada Lovelace	created this.	true	NULL
+card	41	Ada Lovelace	added a description.	false	Orders and revenue for one category
+
+query T
+SELECT query FROM read_json('{METABASE_FIXTURE_URL}/__requests?path=/api/revision') ORDER BY seq DESC LIMIT 1;
+----
+{"entity": "card", "id": "41"}
+
+query TI
+SELECT entity_type, count(*) FROM metabase.main.revisions WHERE entity_id = '2' GROUP BY ALL ORDER BY ALL;
+----
+card	1
+dashboard	3
+
+# --------------------------------------------------------------------- usage
+
+# The API key's own recent views (the dashboards dashboard_cards read count as views).
+query I
+SELECT count(*) FROM metabase.main.recent_views;
+----
+2
+
+# OSS: lifetime counters, no per-day rows.
+query TTTTITT
+SELECT content_type, content_id, title, view_date, view_count, user_count, usage_source FROM metabase.main.content_usage WHERE content_id IN ('2', '40', '41') ORDER BY content_type, content_id;
+----
+card	2	Revenue by state	NULL	0	NULL	lifetime_counters
+card	40	Revenue by Category	NULL	3	NULL	lifetime_counters
+card	41	Orders by Category (SQL)	NULL	2	NULL	lifetime_counters
+dashboard	2	Sales Overview	NULL	7	NULL	lifetime_counters
+
+statement error
+SELECT count(*) FROM metabase.main.query_history;
+----
+<REGEX>:.*query_history needs Metabase Pro/Enterprise Usage Analytics.*
+
+# ----------------------------------------------------------------- run_card
+
+query TIRT
+SELECT * FROM metabase.main.run_card('41', parameters := '{"category": "Gizmo"}');
+----
+Gizmo	4784	383061.9461553011	2029-04-19T14:07:15.657
+
+query TR
+SELECT CATEGORY, round(sum, 2) FROM metabase.main.run_card('40') ORDER BY CATEGORY;
+----
+Doohickey	297270.99
+Gadget	406621.25
+Gizmo	383061.95
+Widget	423667.5
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM metabase.main.run_card('41'));
+----
+CATEGORY	VARCHAR
+ORDERS	BIGINT
+REVENUE	DOUBLE
+LAST_ORDER	VARCHAR
+
+# Defaults apply without parameters (the variable defaults to Widget).
+query TI
+SELECT CATEGORY, ORDERS FROM metabase.main.run_card('41');
+----
+Widget	5061
+
+statement error
+SELECT * FROM metabase.main.run_card('41', parameters := '{"colour": "red"}');
+----
+<REGEX>:.*no parameter 'colour'.*available: category.*
+
+# card_id carries a declared pattern (^[0-9]+$), enforced at bind by the SDK.
+statement error
+SELECT * FROM metabase.main.run_card('abc');
+----
+<REGEX>:.*card_id.*
+
+# -------------------------------------------------------- session login (password)
 
 statement ok
-DROP SECRET metabase_api_test;
+DROP SECRET mb;
 
-# base_url must be http(s).
-statement error
-SELECT * FROM metabase.main.fetch_items('ftp://example.com');
-----
-<REGEX>:.*
+statement ok
+CREATE SECRET mb_session (TYPE metabase, BASE_URL '{METABASE_FIXTURE_URL}', USERNAME 'ada@example.com', PASSWORD 'test-password');
 
-# page_size is a named argument constrained to [1, 1000].
-statement error
-SELECT * FROM metabase.main.fetch_items('{METABASE_MOCK_API}', page_size := 0);
+query TTT
+SELECT model, id, title FROM metabase.main.recent_views ORDER BY viewed_at DESC LIMIT 4;
 ----
-<REGEX>:.*
+collection	11	Scratch
+card	41	Orders by Category (SQL)
+card	40	Revenue by Category
+dashboard	2	Sales Overview
 
-statement error
-SELECT * FROM metabase.main.fetch_items('{METABASE_MOCK_API}', page_size := 5000);
+# A revoked session logs in again once.
+statement ok
+SELECT * FROM read_json('{METABASE_FIXTURE_URL}/__expire_sessions');
+
+query I
+SELECT count(*) FROM metabase.main.groups;
 ----
-<REGEX>:.*
+3
+
+statement ok
+DROP SECRET mb_session;
+
+# -------------------------------------------------- Pro / Enterprise (synthetic)
+
+statement ok
+CREATE SECRET mb_ee (TYPE metabase, BASE_URL '{METABASE_EE_FIXTURE_URL}', API_KEY 'mb_test_api_key');
+
+query TTT
+SELECT version, edition, usage_analytics FROM metabase.main.instance;
+----
+v1.65.4.4	enterprise	true
+
+# Default window: the last 30 days of the View log, grouped by day in Metabase.
+query TTTII
+SELECT content_type, content_id, title, sum(view_count), max(user_count) FROM metabase.main.content_usage GROUP BY ALL ORDER BY ALL;
+----
+card	40	Revenue by Category	2	1
+dashboard	1	E-commerce Insights	1	1
+dashboard	2	Sales Overview	4	2
+
+query I
+SELECT count(*) FROM metabase.main.content_usage WHERE usage_source <> 'usage_analytics' OR view_date IS NULL OR last_viewed_at IS NULL;
+----
+0
+
+query TTI
+SELECT content_type, content_id, sum(view_count) FROM metabase.main.content_usage WHERE view_date >= current_date - 60 AND content_type = 'card' GROUP BY ALL ORDER BY ALL;
+----
+card	40	2
+card	41	1
+
+# view_date >= current_date - 60 became a 61-day [lower, upper) window plus the content_type filter.
+query IT
+SELECT date_diff('day', (f->1->>2)::TIMESTAMPTZ, (f->2->>2)::TIMESTAMPTZ), f->3 FROM (SELECT body::JSON->'query'->'filter' AS f FROM read_json('{METABASE_EE_FIXTURE_URL}/__requests?path=/api/dataset') ORDER BY seq DESC LIMIT 1);
+----
+61	["=",["field","entity_type",{"base-type":"type/Text"}],"card"]
+
+# query_history: the Query log, default window 7 days, newest first.
+query IIII
+SELECT count(*), count(*) FILTER (WHERE status = 'error'), count(DISTINCT card_id), sum(result_rows) FROM metabase.main.query_history;
+----
+6	1	2	210
+
+query TTTT
+SELECT source, status, message, is_native FROM metabase.main.query_history WHERE status = 'error';
+----
+question	error	Table "ORDRES" not found	true
+
+query II
+SELECT count(*), sum(runtime_seconds)::DECIMAL(9,2) FROM metabase.main.query_history WHERE card_id = '40';
+----
+2	0.47
+
+query TT
+SELECT body::JSON->'query'->'filter'->3, body::JSON->'query'->'order-by' FROM read_json('{METABASE_EE_FIXTURE_URL}/__requests?path=/api/dataset') ORDER BY seq DESC LIMIT 1;
+----
+["=",["field","card_id",{"base-type":"type/Integer"}],40]	[["desc",["field","started_at",{"base-type":"type/DateTimeWithLocalTZ"}]]]
+
+query I
+SELECT count(*) FROM metabase.main.query_history WHERE created_at >= now() - INTERVAL 30 DAY;
+----
+7
+
+statement ok
+DROP SECRET mb_ee;

@@ -1,38 +1,194 @@
-<!-- managed-by: vgi-starters (edit upstream in shared/README.md.tmpl, then run tools/render.py) -->
 <p align="center">
   <img src="https://query.farm/media-kit/products/vgi/vgi-logo.png" alt="Vector Gateway Interface (VGI)" width="320">
 </p>
 
-<p align="center"><em>A Query.Farm VGI worker for DuckDB, written in TypeScript.</em></p>
+<p align="center"><em>A Query.Farm VGI worker for DuckDB.</em></p>
 
-# VGI Metabase Worker — TypeScript
+# Query Metabase Dashboards, Questions, Lineage and Usage in DuckDB
 
-[![CI](https://github.com/your-org/vgi-metabase/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/vgi-metabase/actions/workflows/ci.yml)
+> **vgi-metabase** · a [Query.Farm](https://query.farm) VGI worker · written in TypeScript
+
+[![CI](https://github.com/Query-farm/vgi-metabase/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-metabase/actions/workflows/ci.yml)
 [![vgi worker: query.farm](https://query.farm/media-kit/shields/vgi-worker.svg)](https://query.farm)
 
-[VGI](https://query.farm/vgi) lets DuckDB call functions that live in a separate
-process: your code, in any language, exposed as ordinary SQL. This worker adds
-three example functions that you rename and replace with your own:
+Metabase metadata and usage as SQL, read-only, through the
+[Metabase REST API](https://www.metabase.com/docs/latest/api). Works with Metabase OSS
+(self-hosted), Pro / Enterprise and Metabase Cloud: inventory collections, dashboards and
+saved questions / models / metrics; read the SQL or MBQL behind every card; trace MBQL
+questions back to warehouse tables; audit databases, users, groups and data permissions;
+review subscriptions and alerts; and measure usage — per day from
+[Usage Analytics](https://www.metabase.com/docs/latest/usage-and-performance-tools/usage-analytics)
+on Pro / Enterprise, from lifetime view counters on OSS.
 
-| Function | Kind | Shows you how to |
-|---|---|---|
-| `greet(name)` / `greet(name, style)` | scalar | vectorize over a column, overload, constrain a constant |
-| `sequence_table(count, step := 1)` | table | stream rows in batches, take named arguments |
-| `fetch_items(base_url, page_size := 100)` | table | page through a REST API, retry, read a secret |
+```sql
+CREATE SECRET metabase (TYPE metabase,
+    BASE_URL 'https://bi.acme.com',
+    API_KEY 'mb_…');
 
+-- Dashboards nobody opened in 90 days, with their collection.
+SELECT title, folder_path, owner, last_viewed_at
+FROM metabase.main.dashboards
+WHERE NOT archived AND last_viewed_at < now() - INTERVAL 90 DAY
+ORDER BY last_viewed_at;
 
-## Quick start
+-- Which warehouse tables feed which dashboards (MBQL questions).
+SELECT DISTINCT d.dashboard_title, t.table_schema, t.table_name
+FROM metabase.main.dashboard_cards d
+JOIN metabase.main.card_tables t ON t.card_id = d.card_id
+ORDER BY ALL;
 
-**Prerequisites:** [Bun](https://bun.sh) 1.3+ and [uv](https://docs.astral.sh/uv/) (it runs the SQL
-test runner and the metadata checker).
+-- Native SQL questions that mention a table you are about to drop.
+SELECT id, title, native_sql FROM metabase.main.queries
+WHERE query_type = 'native' AND native_sql ILIKE '%legacy_orders%';
 
-```bash
-make build
+-- Run a saved question with a filter value; columns come back typed.
+SELECT * FROM metabase.main.run_card('41', parameters := '{"category": "Gizmo"}');
 ```
 
-Then open DuckDB 2.0 or [Haybarn](https://query.farm/products/haybarn) and attach the
-worker. `LOCATION` is the command DuckDB runs to start it; use an absolute path,
-because a relative one resolves against DuckDB's working directory.
+## Tables and functions
+
+All objects live in `metabase.main` and need a `metabase` secret.
+
+| Object | What it returns | Pushdown |
+|---|---|---|
+| `folders` | Collections (the folder tree) with full paths, personal owners, archive state, official / analytics type | `archived` |
+| `dashboards` | Dashboards: collection path, creator, view count, last view, filter parameters | `archived` |
+| `dashboard_cards` | Cards placed on dashboards: tab, grid position, text cards, filter wiring | `dashboard_id` |
+| `dashboard_tabs` | Dashboard tabs with card counts | `dashboard_id` |
+| `charts` | Saved questions, models and metrics (cards): type, display, native vs MBQL, database, source table / card | `id`, `table_id`, `database_id`, `archived` |
+| `queries` | The query of each card: native SQL text, template tags, MBQL JSON, source tables and cards | as `charts` (`card_id` too) |
+| `card_tables` | Lineage: every table / card each MBQL card reads (main source and joins, every stage), with schema and table names | as `charts` |
+| `connections` | Connected databases: engine, host, port, database name — never passwords, keys, tunnels or JDBC options | `id` |
+| `tables` | Synced tables: schema, display name, entity type, visibility, estimated rows | `id` |
+| `fields` | Columns: base / effective / semantic types, primary and foreign keys (resolved to table and field) | `table_id`, `database_id` |
+| `segments` | Segments (saved filters) with their definition | — |
+| `users` | Users and their group ids — never credentials, login or JWT attributes | `id`, `is_active` |
+| `groups` | Permission groups with member counts | — |
+| `group_permissions` | Data permissions per group and database: view data, create queries, download, data model | — |
+| `subscriptions` | Dashboard subscriptions: schedules per channel; recipients reduced to counts and email domains | `dashboard_id`, `archived` |
+| `alerts` | Question alerts: condition, cron schedules; recipients reduced to counts and email domains | — |
+| `revisions` | Revision history of dashboards, cards and segments | `entity_type`, `entity_id` |
+| `instance` | Version, edition (OSS / enterprise), Cloud, whether Usage Analytics is available | — |
+| `content_usage` | Views per dashboard / card: per day (Usage Analytics) or lifetime counters (OSS) | `view_date` range, `content_type`, `content_id` |
+| `query_history` | Every query run: runtime, rows, source, error, cache hit (Usage Analytics only) | `created_at` range, `card_id`, `dashboard_id`, `user_id`, `database_id`, `source` |
+| `recent_views` | What the secret's identity viewed recently | — |
+| `run_card(card_id, parameters := '{…}')` | A saved question / model / metric's rows, typed from its result metadata | — |
+
+Per-dashboard and per-object tables (`dashboard_cards`, `dashboard_tabs`, `fields`,
+`revisions`) make one API call per parent, so filter on `dashboard_id`, `table_id`,
+`database_id` or `entity_type` / `entity_id` when you can.
+
+### Shared BI columns (UNION across Looker, Tableau and Metabase)
+
+The content tables use the column names the sibling BI workers
+([`vgi-looker`](https://github.com/Query-farm/vgi-looker), `vgi-tableau`) use, so
+inventories UNION cleanly:
+
+| Column | Type | Meaning in Metabase |
+|---|---|---|
+| `tool` | `VARCHAR` | Always `'metabase'` |
+| `id` | `VARCHAR` | Metabase id |
+| `title` | `VARCHAR` | Dashboard / card / collection / database name |
+| `folder_path` | `VARCHAR` | `/Marketing/EMEA` — the collection chain from the root ("Our analytics" is `/`) |
+| `owner` | `VARCHAR` | Display name of the creator (`owner_id` holds the id); personal-collection owner for folders |
+| `created_at` / `updated_at` | `TIMESTAMPTZ` | Creation / last update time |
+| `last_viewed_at` | `TIMESTAMPTZ` | Dashboards: last view. Cards: Metabase's `last_used_at` (last run) — it keeps no separate last-view time for cards |
+| `view_count` | `BIGINT` | Lifetime views Metabase counts |
+| `url` | `VARCHAR` | Link into the Metabase UI (`/dashboard/2`, `/question/41`, `/model/42`, `/metric/43`) |
+
+| Table | Shared columns present |
+|---|---|
+| `dashboards`, `charts` | all of them |
+| `folders` | `tool, id, title, folder_path, owner, created_at, url` |
+| `queries` | `tool, id, url` |
+| `users` | `tool, id, url` (+ `display_name`, `email`) |
+| `connections` | `tool, id, title, created_at, updated_at, url` |
+| `content_usage` | `tool, url` (+ `content_type, content_id, title, view_date, view_count`) |
+
+```sql
+SELECT tool, id, title, folder_path, owner, view_count, url FROM looker.main.dashboards
+UNION ALL BY NAME
+SELECT tool, id, title, folder_path, owner, view_count, url FROM metabase.main.dashboards;
+```
+
+### Usage: OSS vs Pro / Enterprise
+
+`SELECT edition, usage_analytics FROM metabase.main.instance` tells you which applies.
+
+- **Pro / Enterprise with Usage Analytics** (the `audit_app` token feature): the worker
+  finds the "View log" and "Query log" models in the Usage Analytics collection and
+  queries them with read-only ad-hoc MBQL (`POST /api/dataset`, which saves nothing).
+  `content_usage` has one row per (content_type, content_id, UTC day) with `view_count`,
+  `user_count` and `last_viewed_at` — Metabase does the grouping; `query_history` has one
+  row per query execution. The API identity needs access to the Usage analytics collection.
+- **OSS** (or without the feature): Metabase exposes only lifetime counters.
+  `content_usage` returns one row per live dashboard and card with `view_count` and
+  `last_viewed_at` (cards: `last_used_at`), `view_date` and `user_count` NULL and
+  `usage_source = 'lifetime_counters'` — a `view_date` filter therefore returns no OSS
+  rows. `query_history` raises an error explaining that OSS has no query log.
+  `recent_views` (the identity's own recent items) works on every edition.
+
+### `run_card` result types
+
+Columns keep Metabase's names (`CATEGORY`, `sum`, `count`; repeats get `_2`) and take
+their type from the card's `result_metadata`: `type/Integer` / `BigInteger` `BIGINT`,
+`Float` / `Decimal` `DOUBLE`, `Boolean` `BOOLEAN`, `Date` `DATE`, `DateTime` `TIMESTAMP`,
+zoned date-times `TIMESTAMPTZ`, `JSON` / `Dictionary` / `Array` `JSON`, everything else
+`VARCHAR`. A card that has never run has no metadata; the bind then runs it once to learn
+its columns. `parameters` is a JSON object keyed by a card parameter's slug or a native
+question's `{{variable}}` name; omit it to use the defaults. Metabase returns at most
+2,000 rows per API query. Running a card counts as a view of that card.
+
+## Authentication
+
+Create an [API key](https://www.metabase.com/docs/latest/people-and-groups/api-keys)
+(Admin settings > Authentication > API keys, Metabase 0.49+) in a group that can see the
+content you want — the Administrators group sees everything, including users, permissions
+and connections. Or use a username and password.
+
+```sql
+CREATE SECRET metabase (TYPE metabase,
+    BASE_URL 'https://acme.metabaseapp.com',   -- Metabase Cloud, or your own host (+ path prefix)
+    API_KEY 'mb_…');                           -- sent as x-api-key
+
+CREATE SECRET metabase_login (TYPE metabase,
+    BASE_URL 'https://bi.acme.com',
+    USERNAME 'analyst@acme.com', PASSWORD '…', -- POST /api/session; the session is cached
+    PAGE_SIZE '500');                          -- optional: users listing page size
+```
+
+A password login posts to `/api/session`, caches the session id in memory and logs in
+again after a 401. Credentials and session ids never enter scan state, URLs, logs or error
+messages. `http://` is accepted only for `127.0.0.1` / `localhost` (test fixtures).
+
+## Pushdown, paging, rate limits and side effects
+
+- `WHERE` predicates on the columns in the table above become API parameters (`f=table`,
+  `f=database`, `f=archived`, `status=deactivated`, `entity=card&id=41`, single-object
+  endpoints) or, for Usage Analytics, MBQL filters on the View log / Query log. DuckDB
+  re-checks every predicate exactly, so pushdown only narrows what is fetched.
+- The users listing pages with `limit` + `offset`; Usage Analytics queries page with MBQL
+  `page` (2,000 rows); per-dashboard, per-database and per-object fan-outs keep their
+  pending ids in scan state. All cursors are serializable, so scans resume across
+  processes over HTTP.
+- 429 responses wait for `Retry-After`; 5xx and network errors back off exponentially.
+- **Read-only.** The only non-GET calls are `POST /api/session` (login),
+  `POST /api/card/:id/query` (`run_card`) and `POST /api/dataset` (a SELECT over the Usage
+  Analytics models). Nothing is created, updated or deleted. Two reads have side effects
+  inside Metabase itself: `GET /api/dashboard/:id` — used by `dashboard_cards` and
+  `dashboard_tabs`, there is no other endpoint for dashboard layout — counts as a view of
+  that dashboard, and `run_card` counts as a view / run of the card. Use a dedicated API
+  key so those views are attributable. `dashboards` never calls the per-dashboard
+  endpoint (its `id` filter is applied locally).
+
+## Install
+
+**Prerequisites:** [Bun](https://bun.sh) 1.3+ (for a source checkout).
+
+```bash
+git clone https://github.com/Query-farm/vgi-metabase.git && cd vgi-metabase
+bun install --frozen-lockfile
+```
 
 **DuckDB 2.0:**
 
@@ -52,244 +208,55 @@ LOAD vgi;
 ATTACH 'metabase' (TYPE vgi, LOCATION '/abs/path/to/vgi-metabase/bin/vgi-metabase-worker');
 ```
 
-Now call the functions:
-
-```sql
-SELECT metabase.main.greet('Ada');                         -- Hi, Ada!
-SELECT metabase.main.greet('Ada', 'formal');               -- Good day, Ada.
-SELECT * FROM metabase.main.sequence_table(5, step := 2) ORDER BY n;
-```
-
-`fetch_items` pages through a REST API. Try it against the public demo API (25 fixed items):
-
-```sql
-SELECT category, count(*) AS items, round(avg(price), 2) AS avg_price
-FROM metabase.main.fetch_items('https://vgi-starter-api.query-farm.services/v1')
-GROUP BY category ORDER BY category;
-```
-
-If an older cached extension misbehaves, refresh it with `FORCE INSTALL vgi FROM query_farm;`
-(DuckDB) or `FORCE INSTALL vgi FROM community;` (Haybarn).
-
-## Using it in a pipeline
-
-Worker functions compose with everything else in DuckDB:
-
-```sql
--- Materialize an API into a local table.
-CREATE TABLE items AS SELECT * FROM metabase.main.fetch_items('https://vgi-starter-api.query-farm.services/v1');
-
--- Join it with local files.
-SELECT i.name, i.price, s.units
-FROM items i JOIN 'sales.parquet' s ON s.item_id = i.id;
-
--- Call a scalar per row of another table.
-SELECT customer, metabase.main.greet(customer, 'formal') FROM read_csv('customers.csv');
-```
-
-## Project layout
-
-```
-src/
-  worker.ts        # entry point: serves the catalog over stdio, --unix or --http
-  catalog.ts       # assembles the catalog; add new functions to FUNCTIONS
-  meta.ts          # catalog/schema metadata + helpers (objectTags, column)
-  greet.ts         # scalar example (overloads, const param with choices)
-  sequence.ts      # table function example (named args, streaming state)
-  fetch_items.ts   # REST API table function (pagination, retries, secrets)
-  cli.ts           # flag parsing: stdio / --unix / --http (PORT:<n>, /health)
-  log.ts           # stderr logger
-bin/               # vgi-metabase-worker (what DuckDB launches) and run-recipe
-tests/             # bun unit tests (worker subprocess + mock API)
-test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
-examples/          # recipes: pushdown, caching, catalog tables, aggregates, COPY …
-ci/                # integration harness used by `make test-sql` and CI
-scripts/           # vgi_template.py (init / template-diff)
-vgi-agent-tests.yaml  # private graders for the agent test tasks
-```
-
-## Adding a function
-
-1. Create `src/<name>.ts`. Copy the closest example: `greet.ts` for a scalar,
-   `sequence.ts` for a generator, `fetch_items.ts` for an API.
-2. Declare arguments: `params` + `argDocs` (scalars), or the ordered `parameters`
-   list when a constant needs `choices`/`ge`/`le`. Table functions use `args`,
-   `argDocs` and `argConstraints`; an argument listed in `argDefaults` becomes a
-   named argument (`step := 2`), the others are positional.
-3. Give it `description`, `tags: objectTags(...)` (from `src/meta.ts`) and
-   `examples`.
-4. Add it to `FUNCTIONS` in `src/catalog.ts`.
-
-**Which kind of function?**
-
-| You want to… | Use |
-|---|---|
-| compute one value per input row | a **scalar** function |
-| return a set of rows from arguments (an API, a file, a generator) | a **table** function |
-| transform or aggregate the rows of a query | a **table in-out** function or an **aggregate** |
-| expose a fixed dataset by name (`SELECT * FROM metabase.main.t`) | a **catalog table** |
-| write data out to a file or service | `COPY … TO` with a copy function |
-| accept `INSERT` / `UPDATE` / `DELETE` | a catalog table with insert/update/delete functions |
-
-The [examples/](examples/) folder has a recipe for most of these. Writable tables have no
-recipe:
-
-A writable table is a `TableDescriptor` that names a table in-out function per operation in
-`insertFunction`, `updateFunction` and `deleteFunction`, with the richest result each one
-produces in `writeResultModes`. `writeOptions`, `writeResultSchema`, `writeResultBatch` and
-`rowIdField` (all exported by `@query-farm/vgi`) read DuckDB's `write_options` argument and
-build the result. UPDATE and DELETE need the table's scan `function` to emit `rowIdField()` and
-support projection pushdown. Transactions: return `supports_transactions` from the catalog's
-attach and override `transactionBegin` / `transactionCommit` / `transactionRollback`.
-Since VGI protocol 3.3 a table's scan and write functions are table-only: hidden from
-`duckdb_functions()` and not callable from SQL. Set `exposeScan: true` on the table to keep the
-scan callable as an ordinary table function too (write functions never are).
-[`examples/simple-writable-worker.ts`](https://github.com/Query-farm/vgi-typescript/blob/main/examples/simple-writable-worker.ts)
-and `examples/writable-tx-worker.ts` in vgi-typescript are complete workers.
-
-## Secrets and configuration
-
-`fetch_items` shows the recommended pattern. A bearer token comes from a DuckDB secret
-when one exists, and from an environment variable otherwise:
-
-```sql
-CREATE SECRET (TYPE metabase_api, TOKEN 'your-token');      -- per session, never logged
-```
-
-```bash
-METABASE_API_TOKEN=your-token make run-http                # for servers and containers
-```
-
-Try it: the demo API's `/v1/auth` endpoint needs the published token `demo-token`.
-
-```sql
-SELECT count(*) FROM metabase.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- fails: HTTP 401
-CREATE SECRET (TYPE metabase_api, TOKEN 'demo-token');
-SELECT count(*) FROM metabase.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- 25
-```
-
-Never bake credentials into the image or the source. If a function can't run without
-real credentials, its examples can't execute in CI either. Set `execute: false` on the
-metadata check for that worker (see `.github/workflows/ci.yml`), and add
-`LINT_ARGS ?= --no-execute` to the Makefile so local runs match.
+`LOCATION` is the command DuckDB runs, so use an absolute path. Tagged releases ship
+signed standalone executables (no Bun needed) for Linux, macOS (arm64) and Windows; point
+`LOCATION` at the downloaded binary. The same binary serves HTTP with `--http --port 8000`
+(see the `Dockerfile`).
 
 ## Testing
 
 ```bash
-make test-unit                 # fast TypeScript unit tests
-make test-sql                  # test/sql/*.test through DuckDB (stdio)
+make test-unit                 # bun unit tests (MBQL parsing, masking, typing, parameters, login/retry)
+make test-sql                  # test/sql/metabase.test through Haybarn 2.0 (stdio)
 make test-sql TRANSPORT=http   # …over HTTP (also: launch)
 make check                     # everything CI runs
 ```
 
-`test/sql/*.test` files are [sqllogictest](https://duckdb.org/docs/stable/dev/sqllogictest/intro)
-scripts. `ci/run-integration.sh` runs them against your worker and fails on any
-unexpected skip, so a broken transport can't hide behind a green run.
-`fetch_items` is tested against `test/mock_api/server.py` so tests are fast and
-offline.
+No test touches the network or a live Metabase. `test/mock_api/server.py` is a stdlib-only
+**record / replay server**. `test/fixtures/metabase-recording.json` holds responses recorded
+from a real `metabase/metabase:v0.65.4.4` (OSS) container that
+`test/fixtures/seed_metabase.py` set up through the API (setup token → admin, users and a
+deactivated user, a group, a collection tree, MBQL and native SQL questions with a template
+tag, a model, an archived metric, a segment, a two-tab dashboard with a filter and a text
+card, a subscription and an alert with an external recipient, an API key, revisions and
+views). Replay is strict: any request that was not recorded fails with HTTP 400. The server
+emulates Metabase auth with test credentials (`x-api-key` and `/api/session`, with session
+revocation), injects one 429 and one 503 so the retry paths always run, and logs requests
+at `/__requests` so the SQL tests assert exactly what was pushed down.
 
-**Testing against real data:** put live tests in their own `.test` file that starts with
-`require-env METABASE_LIVE`. They run only when that variable is set. Add the skip reason
-to `EXPECTED_SKIP_REASONS` in CI.
+Synthetic additions (not recorded, documented in the server): a second connection whose
+details carry a fake password, SSH key and JDBC options (the tests prove none reach SQL),
+and `--edition ee`, a Pro / Enterprise variant with a Usage Analytics collection whose
+"View log" / "Query log" models answer the worker's MBQL (filters, day breakouts, count /
+distinct / max, order, page) from hand-built logs. The Pro / Enterprise path is therefore
+tested against documented model columns, not a licensed instance.
 
-## Metadata and the quality score
-
-DuckDB, agents and documentation tools discover your functions through their metadata:
-titles, descriptions, argument docs, examples and keywords.
-[vgi-lint](https://github.com/Query-farm/vgi-lint-check) checks it, and CI runs it on
-every push. Its settings live in `vgi-lint.toml`, which `make lint-explain`,
-`vgi-lint lint`, and CI all read. This template scores 100/100 with no findings.
-
-```bash
-make lint-explain                              # findings, each with its fix
-make lint-explain LINT_ARGS="--format agent"   # the same, grouped for coding agents
-make lint-ai                                   # optional: an agent must solve vgi-agent-tests.yaml
-```
-
-Each report also states an **assurance level**: how much was actually verified.
-
-| Level | Reached when | Here |
-|---|---|---|
-| L1 structural | the static metadata is clean | workers that need real credentials (`execute: false` in CI) |
-| L2 behavioural | the examples also run and return what they claim | **the CI gate** |
-| L3 semantic | an agent solves the worker's own test tasks, and the docs are reviewed | `make lint-ai`, before publishing |
-
-- **How strict.** Your copy fails on warnings (`fail_on = "warning"` in `vgi-lint.toml`).
-  Raise it to `"info"` before you publish the worker for others.
-- **The linter isn't pinned.** It tracks the current quality bar, so a new rule can flag
-  metadata that passed yesterday. Fix it, or waive the finding.
-- **Waivers.** If a finding is genuinely wrong for your worker, waive it in
-  `vgi-lint.toml` with a `kind` and a `reason`.
-- **Existing workers.** If you're adding this gate to a worker that already has
-  findings, record them with `vgi-lint lint --baseline vgi-lint-baseline --update-baseline`
-  and set `baseline` in `vgi-lint.toml`. After that, only new findings fail.
-
-Metadata lives in `src/meta.ts` and the `tags`/`examples` of each function.
-
-## Logging and debugging
-
-stdout carries the Arrow protocol, so **never print to stdout**. Log to stderr instead.
-Use `log` from `src/log.ts` (it writes to stderr); `--debug` or `--log-level debug` turns it up and also enables the SDK's own tracing (`VGI_DEBUG`).
-
-- Under DuckDB (stdio/launch), worker stderr shows up in DuckDB's error messages and
-  terminal.
-- In Docker it goes to `docker logs`.
-- `make debug` runs one query against the worker with debug logging on.
-
-## Deploying
-
-The same binary serves stdio (DuckDB starts it locally) or HTTP (you host it):
+To re-record (needs Docker, ~1.5 GB RAM):
 
 ```bash
-docker build -t weather-worker .
-docker run -p 8000:8000 -e METABASE_API_TOKEN=... weather-worker   # health: GET /health
+docker run -d --name vgi-metabase-server --memory 2500m -e JAVA_OPTS="-Xmx1g" \
+    -p 127.0.0.1:3917:3000 metabase/metabase:v0.65.4.4
+python3 test/fixtures/seed_metabase.py http://127.0.0.1:3917 > /tmp/seed.json
+python3 test/fixtures/record.py http://127.0.0.1:3917 /tmp/seed.json
+docker rm -f vgi-metabase-server
 ```
 
-```sql
-ATTACH 'metabase' (TYPE vgi, LOCATION 'https://workers.example.com/metabase');
-```
+The metadata check runs with `execute: false` in CI: every object needs a `metabase`
+secret for a live site.
 
-Put hosted workers behind TLS and authentication. See
-[authentication](https://query.farm/vgi/authentication) for bearer tokens and JWTs, and
-[distributing a worker](https://query.farm/vgi/distributing-a-worker) for packaging.
-Pass secrets with `-e` or your platform's secret manager.
+## Authorship & License
 
-## Releasing
+Written by [Query.Farm](https://query.farm). Released under the
+[BSD Zero Clause License](LICENSE) (0BSD).
 
-Push a tag like `v0.1.0`. The release workflow compiles the worker with `bun build --compile` into a standalone executable for Linux (x86-64, arm64), macOS (arm64) and Windows (x86-64), and attaches the archives to the GitHub release. Users download one file and point `LOCATION` at it, with no Bun or `node_modules` on the host. Every artifact is signed with cosign and
-carries SLSA build provenance. `ci/check-version.sh` makes sure the tag matches the
-version in `package.json`.
-
-## Using with coding agents
-
-[AGENTS.md](AGENTS.md) is written for AI coding agents (Claude Code reads it via
-`CLAUDE.md`; Codex, Cursor and others read it directly). It covers the commands, the
-recipe for adding a function, the metadata checklist and the sharp edges. A good first
-prompt:
-
-> Read AGENTS.md. Replace `fetch_items` with `forecast(lat DOUBLE, lon DOUBLE)` that calls
-> the Open-Meteo API. Include full metadata, a mock-server test and a `METABASE_LIVE` test.
-> You're done when `make check` passes.
-
-## Keeping up with the template
-
-`make template-diff` shows what changed upstream (CI, docs, examples) since your copy was
-made. Your copy records its template version in `.vgi-metabase.json`.
-
-## Learn more
-
-- [What is VGI?](https://query.farm/vgi) · [Getting started](https://query.farm/vgi/getting-started) · [Building a worker](https://query.farm/vgi/building-a-worker)
-- [TypeScript SDK docs](https://query.farm/vgi/docs/typescript/): [scalar tutorial](https://query.farm/vgi/docs/typescript/tutorial/scalar/), [table tutorial](https://query.farm/vgi/docs/typescript/tutorial/table/)
-- [Distributing a worker](https://query.farm/vgi/distributing-a-worker) · [Choosing a language](https://query.farm/vgi/languages) · [llms.txt](https://query.farm/vgi/llms.txt)
-- SDK source: [@query-farm/vgi](https://github.com/Query-farm/vgi-typescript) · RPC layer: [https://vgi-rpc-typescript.query.farm](https://vgi-rpc-typescript.query.farm)
-
-## Support
-
-Open an issue on this repository. For VGI itself, see [query.farm](https://query.farm).
-
-## Authorship & license
-
-The starter template is written by [Query.Farm](https://query.farm) and released under
-the [BSD Zero Clause License](LICENSE) (0BSD). Use it for anything, with no attribution
-required. Replace this section with your own license once the code is yours.
+Copyright 2026 Query Farm LLC - https://query.farm

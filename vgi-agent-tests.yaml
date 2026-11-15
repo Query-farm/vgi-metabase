@@ -1,16 +1,84 @@
 # Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
-# `vgi-lint lint --ai` runs an agent on each prompt and grades it with check_sql.
-# See https://github.com/Query-farm/vgi-lint-check (VGI920).
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it (VGI920).
+#
+# Every metabase object needs a `metabase` secret pointing at a Metabase site (the offline
+# replay server in test/mock_api/server.py works too, with the recording of the seeded
+# container). Content and configuration are stable between the agent's run and the
+# reference run, so every task compares against a reference query.
 tasks:
-  - name: formal_greeting
-    reference_sql: SELECT metabase.main.greet('Grace', 'formal') AS greeting
-  - name: sum_of_squares
-    reference_sql: SELECT sum(squared) AS total FROM metabase.main.sequence_table(10)
-  - name: stepped_sequence
-    reference_sql: SELECT n FROM metabase.main.sequence_table(4, step := 5) ORDER BY n
-  # Reads the public demo API (https://vgi-starter-api.query-farm.services/v1).
-  - name: items_per_category
-    check_sql: >-
-      SELECT count(*) = 3 AND sum(items) = 25
-      FROM (SELECT category, count(*) AS items
-            FROM metabase.main.fetch_items('https://vgi-starter-api.query-farm.services/v1') GROUP BY category)
+  - name: most_viewed_dashboard
+    reference_sql: SELECT title FROM metabase.main.dashboards ORDER BY view_count DESC LIMIT 1
+  - name: emea_questions
+    reference_sql: SELECT title FROM metabase.main.charts WHERE folder_path = '/Marketing/EMEA' ORDER BY title
+  - name: native_questions
+    reference_sql: >-
+      SELECT title FROM metabase.main.charts
+      WHERE query_type = 'native' AND card_type = 'question' AND NOT archived ORDER BY title
+  - name: models
+    reference_sql: SELECT title FROM metabase.main.charts WHERE card_type = 'model' AND NOT archived ORDER BY title
+  - name: archived_cards
+    reference_sql: SELECT title FROM metabase.main.charts WHERE archived ORDER BY title
+  - name: deactivated_users
+    reference_sql: SELECT email FROM metabase.main.users WHERE NOT is_active ORDER BY email
+  - name: admins
+    reference_sql: SELECT display_name FROM metabase.main.users WHERE is_superuser AND is_active ORDER BY 1
+  - name: connection_engines
+    reference_sql: SELECT title, engine FROM metabase.main.connections ORDER BY title
+  - name: revenue_lineage
+    reference_sql: >-
+      SELECT DISTINCT table_name FROM metabase.main.card_tables
+      WHERE card_title = 'Revenue by Category' AND table_name IS NOT NULL ORDER BY 1
+  - name: dashboard_tabs
+    reference_sql: >-
+      SELECT title, card_count FROM metabase.main.dashboard_tabs
+      WHERE dashboard_title = 'Sales Overview' ORDER BY position
+  - name: external_subscriptions
+    reference_sql: >-
+      SELECT title FROM metabase.main.subscriptions
+      WHERE len(list_filter(recipient_domains, d -> d <> 'example.com')) > 0 ORDER BY title
+  - name: alert_cards
+    reference_sql: SELECT DISTINCT card_title FROM metabase.main.alerts ORDER BY 1
+  - name: native_sql_groups
+    reference_sql: >-
+      SELECT group_name FROM metabase.main.group_permissions
+      WHERE database_name = 'Sample Database' AND create_queries = 'query-builder-and-native' ORDER BY 1
+  - name: fk_orders
+    reference_sql: >-
+      SELECT f.name, t.table_name AS target_table, f.fk_target_field_name FROM metabase.main.fields f
+      JOIN metabase.main.tables t ON t.id = f.fk_target_table_id
+      WHERE f.table_name = 'ORDERS' AND f.semantic_type = 'type/FK' ORDER BY f.name
+  - name: edition
+    reference_sql: SELECT version, edition, usage_analytics FROM metabase.main.instance
+  - name: card_41_history
+    reference_sql: >-
+      SELECT user_name, description FROM metabase.main.revisions
+      WHERE entity_type = 'card' AND entity_id = '41' ORDER BY changed_at
+  - name: run_card_gizmo
+    reference_sql: >-
+      SELECT ORDERS FROM metabase.main.run_card('41', parameters := '{"category": "Gizmo"}')
+  - name: segments
+    reference_sql: >-
+      SELECT s.title, t.table_name FROM metabase.main.segments s
+      JOIN metabase.main.tables t ON t.id = s.table_id ORDER BY s.title
+  - name: recent_dashboards
+    reference_sql: SELECT title FROM metabase.main.recent_views WHERE model = 'dashboard' ORDER BY title
+  - name: usage_top_card
+    reference_sql: >-
+      SELECT title FROM metabase.main.content_usage WHERE content_type = 'card'
+      GROUP BY title ORDER BY sum(view_count) DESC LIMIT 1
+  - name: sales_overview_cards
+    reference_sql: >-
+      SELECT card_title FROM metabase.main.dashboard_cards
+      WHERE dashboard_title = 'Sales Overview' AND card_id IS NOT NULL ORDER BY card_title
+  - name: marketing_subcollections
+    reference_sql: >-
+      SELECT c.title FROM metabase.main.folders c JOIN metabase.main.folders p ON p.id = c.parent_id
+      WHERE p.title = 'Marketing' ORDER BY c.title
+  - name: group_sizes
+    reference_sql: SELECT title, member_count FROM metabase.main.groups ORDER BY title
+  - name: sql_of_question
+    reference_sql: >-
+      SELECT native_sql FROM metabase.main.queries WHERE title = 'Orders by Category (SQL)'
+  # Needs a Pro/Enterprise site with Usage Analytics (the replay server's --edition ee mode).
+  - name: failed_queries
+    reference_sql: SELECT count(*) FROM metabase.main.query_history WHERE status = 'error'
