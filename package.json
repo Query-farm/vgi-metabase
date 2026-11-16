@@ -1,5 +1,5 @@
 {
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "Metabase collections, dashboards, questions, models, lineage, permissions, subscriptions and usage as SQL tables in DuckDB.",
