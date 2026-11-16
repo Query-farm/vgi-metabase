@@ -108,6 +108,18 @@ def ago(days: float = 0, hours: float = 0) -> str:
     return (START - dt.timedelta(days=days, hours=hours)).isoformat().replace("+00:00", "Z")
 
 
+def view_day_ago(days: int, hours: float) -> str:
+    """A View-log timestamp ``days`` UTC calendar days ago, ``hours`` before noon.
+
+    content_usage groups views by UTC day, so a view's day must not depend on
+    the time the suite runs: plain ``ago(1, 5)`` falls on two days back when
+    the suite starts before 05:00 UTC, which changed the per-day user counts.
+    """
+    midnight = START.replace(hour=0, minute=0, second=0)
+    ts = midnight - dt.timedelta(days=days) + dt.timedelta(hours=12 - hours)
+    return ts.isoformat().replace("+00:00", "Z")
+
+
 def view_log() -> list[dict]:
     rows = []
     for i, (etype, eid, user, d, h) in enumerate([
@@ -115,7 +127,7 @@ def view_log() -> list[dict]:
         ("dashboard", 2, 1, 3, 1), ("dashboard", 1, 3, 3, 2), ("card", 40, 1, 1, 5),
         ("card", 40, 2, 2, 1), ("card", 41, 1, 40, 1), ("dashboard", 2, 1, 45, 1),
     ]):
-        rows.append({"id": i + 1, "timestamp": ago(d, h), "user_id": user, "entity_type": etype,
+        rows.append({"id": i + 1, "timestamp": view_day_ago(d, h), "user_id": user, "entity_type": etype,
                      "entity_id": eid, "entity_qualified_id": f"{etype}_{eid}"})
     return rows
 
