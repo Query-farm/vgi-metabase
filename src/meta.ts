@@ -90,19 +90,18 @@ export const CATALOG_COMMENT =
 
 export const CATALOG_DOC_LLM =
   "Read-only SQL access to a Metabase site (OSS self-hosted, Pro / Enterprise, or Metabase Cloud) through its " +
-  "REST API. Reach for it to inventory BI content (folders = collections with full paths, dashboards with " +
-  "filter parameters, dashboard_cards and dashboard_tabs, charts = saved questions / models / metrics, queries " +
-  "with native SQL text or MBQL), trace lineage (card_tables: the tables and cards each MBQL question reads, " +
-  "with schema and table names; native SQL is not parsed), audit the data model (connections without " +
-  "passwords, tables, fields with semantic types and foreign keys, segments) and access (users without " +
-  "credentials, groups, group_permissions), review delivery (subscriptions and alerts with recipients masked " +
-  "to counts and email domains), measure usage (content_usage: per-day views from Usage Analytics on " +
-  "Pro/Enterprise, lifetime counters on OSS; query_history: the Usage Analytics query log; recent_views; " +
-  "revisions; instance tells which edition and usage source apply), and fetch results with " +
-  "run_card(card_id, parameters := '{...}'). Everything needs a `metabase` DuckDB secret: BASE_URL plus " +
-  "API_KEY (sent as x-api-key) or USERNAME / PASSWORD (a session login). Content tables share columns with " +
-  "the Looker and Tableau workers (tool, id, title, folder_path, owner, created_at, updated_at, " +
-  "last_viewed_at, view_count, url) so they UNION across BI tools. Docs: https://www.metabase.com/docs/latest/api .";
+  "REST API. Reach for it to inventory BI content (collections as folders with full paths, dashboards with " +
+  "their filter parameters, cards and tabs, saved questions / models / metrics with their native SQL or MBQL), " +
+  "trace lineage from MBQL questions to the tables and cards they read (native SQL is not parsed), audit the " +
+  "data model (database connections without passwords, tables, fields with semantic types and foreign keys, " +
+  "segments) and access (users without credentials, groups and their data permissions), review delivery " +
+  "(subscriptions and alerts with recipients masked to counts and email domains), measure usage (per-day " +
+  "views and the query log from Usage Analytics on Pro/Enterprise, lifetime counters on OSS, plus recent " +
+  "views and revision history), and fetch the typed results of a saved question. Everything needs a " +
+  "`metabase` DuckDB secret: BASE_URL plus API_KEY (sent as x-api-key) or USERNAME / PASSWORD (a session " +
+  "login). Content tables share columns with the Looker and Tableau workers (tool, id, title, folder_path, " +
+  "owner, created_at, updated_at, last_viewed_at, view_count, url) so they UNION across BI tools. Docs: " +
+  "https://www.metabase.com/docs/latest/api .";
 
 export const CATALOG_DOC_MD =
   "# Metabase\n\n" +
@@ -115,20 +114,22 @@ export const CATALOG_DOC_MD =
   SOURCES_MD;
 
 export const SCHEMA_DOC_LLM =
-  "Metabase REST collections as tables, plus run_card. Content: folders (collections), dashboards, " +
-  "dashboard_cards, dashboard_tabs, charts (cards: questions, models, metrics), queries. Lineage: card_tables. " +
-  "Data model: connections, tables, fields, segments. Admin: users, groups, group_permissions. Delivery: " +
-  "subscriptions, alerts. Usage: instance, content_usage, query_history (Pro/Enterprise), recent_views, " +
-  "revisions. Results: run_card(card_id, parameters := '{...}'). Per-dashboard and per-object tables " +
-  "(dashboard_cards, dashboard_tabs, fields, revisions) make one API call per parent, so filter " +
-  "dashboard_id / database_id / entity_id when you can. All objects need a `metabase` secret.";
+  "Metabase REST collections exposed as tables, grouped into content, lineage, data model, administration, " +
+  "delivery and usage, plus one function that runs a saved question with optional parameters and returns " +
+  "typed rows. Tables that expand per dashboard, per database or per object make one API call per parent, so " +
+  "filter dashboard_id, database_id or entity_id when you can. Which usage source applies (Usage Analytics on " +
+  "Pro/Enterprise or lifetime counters on OSS) depends on the edition, which the instance table reports. All " +
+  "objects need a `metabase` secret.";
+
+export const SCHEMA_COMMENT = "Metabase content, lineage, data model, admin, delivery and usage.";
 
 export const SCHEMA_DOC_MD =
   "## main\n\n" +
-  "Metabase content, lineage, data model, administration, delivery and usage as tables; `run_card` returns " +
-  "typed results.\n\n" +
-  "All objects need a `metabase` secret; id, archived, database and dashboard filters push down into the " +
-  "API, and time windows into Usage Analytics queries.";
+  "Every Metabase collection this worker reads is a table here, plus a function that returns the typed " +
+  "results of a saved question.\n\n" +
+  "All objects need a `metabase` secret. Id, archived, database and dashboard filters push down into the " +
+  "API, and time windows into Usage Analytics queries; tables that fan out per dashboard or database make one " +
+  "API call per parent, so filter them when you can.";
 
 export const AGENT_TEST_TASKS = [
   { name: "most_viewed_dashboard", prompt: "Which Metabase dashboard has the most views?" },
