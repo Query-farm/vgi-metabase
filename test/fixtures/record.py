@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-HAYBARN = os.environ.get("HAYBARN_CLI", "uvx -q --from haybarn-cli==2.0.0rc11 haybarn -no-agent")
+HAYBARN = os.environ.get("HAYBARN_CLI", "uvx -q --from haybarn-cli==2.0.1rc3 haybarn -no-agent")
 
 
 def statements(test: Path) -> list[str]:
